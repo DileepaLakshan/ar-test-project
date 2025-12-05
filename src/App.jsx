@@ -1,123 +1,136 @@
 import React, { useState, useRef } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
-import { OrbitControls, PerspectiveCamera } from '@react-three/drei';
 import * as THREE from 'three';
 
 /**
- * SIMULATED AR SETUP
- * Since @react-three/xr is not available in this environment, 
- * we simulate the AR experience.
- * * To switch to Real AR:
+ * ⚠️ IMPORTANT FOR LOCAL DEVELOPMENT ⚠️
+ * The preview environment here does not support '@react-three/xr'.
+ * * TO ENABLE REAL AR ON YOUR PHONE:
  * 1. npm install @react-three/xr
- * 2. Import { XR, ARButton, useHitTest, Interactive } from '@react-three/xr'
- * 3. Wrap everything in <XR> instead of <React.Fragment>
- * 4. Use useHitTest instead of the onPointerMove logic below
+ * 2. Uncomment the import below.
+ * 3. Remove/Comment out the "MOCK COMPONENTS" section below.
  */
+
+// [REAL AR IMPORT] - Uncomment this line in your local project
+// import { XR, ARButton, useHitTest, Interactive } from '@react-three/xr';
+
+// [MOCK COMPONENTS] - Remove these when running locally with the real library
+const XR = ({ children }) => <>{children}</>;
+const Interactive = ({ onSelect, children }) => <group onClick={onSelect}>{children}</group>;
+const ARButton = () => (
+  <button 
+    className="absolute bottom-10 z-20 bg-gray-600 text-white font-bold py-3 px-8 rounded-full shadow-lg"
+    onClick={() => alert("This is a mock button. Run locally with @react-three/xr to enter AR.")}
+  >
+    Start AR (Mock)
+  </button>
+);
+// Mock useHitTest: acts like a loop but doesn't do real hit testing in preview
+const useHitTest = (callback) => {
+  useFrame((state) => {
+    // In a real app, this provides the hit matrix from the AR Session.
+    // Here we do nothing, so the reticle stays at 0,0,0
+  });
+};
 
 /**
  * Reticle Component
- * In a real AR app, this follows the physical world surfaces via useHitTest.
- * Here, we simulate it by tracking the mouse pointer on a virtual floor.
+ * Tracks the real-world surfaces using WebXR Hit Test.
  */
-function Reticle({ visible, position, rotation }) {
+function Reticle({ onPlace }) {
+  const ref = useRef();
+
+  // continuously checks for surfaces in the real world
+  useHitTest((hitMatrix, hit) => {
+    // If a surface is found, move this mesh to that position/rotation
+    if (ref.current) {
+      hitMatrix.decompose(
+        ref.current.position,
+        ref.current.quaternion,
+        ref.current.scale
+      );
+    }
+  });
+
   return (
-    <group position={position} rotation={rotation} visible={visible}>
-      {/* The Visual Grid - A GridHelper that shows the plane */}
+    <group ref={ref}>
+      {/* Visual Marker for the Reticle */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
         <ringGeometry args={[0.1, 0.25, 32]} />
-        <meshStandardMaterial color="white" emissive="white" emissiveIntensity={0.5} />
+        <meshStandardMaterial color="white" />
       </mesh>
       
-      {/* A larger grid to visualize the floor plane context */}
+      {/* Dynamic Grid to visualize the detected plane */}
       <gridHelper args={[2, 10, 'cyan', 'teal']} position={[0, -0.01, 0]} />
-      
-      {/* Pulse effect ring */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[0.26, 0.28, 32]} />
-        <meshBasicMaterial color="cyan" transparent opacity={0.5} />
-      </mesh>
+
+      {/* Invisible interactive plane to handle taps */}
+      {/* When the user taps specifically on this reticle, we trigger placement */}
+      <Interactive onSelect={onPlace}>
+        <mesh rotation={[-Math.PI / 2, 0, 0]} visible={false}>
+          <circleGeometry args={[0.3, 32]} />
+          <meshBasicMaterial transparent opacity={0} />
+        </mesh>
+      </Interactive>
     </group>
   );
 }
 
 /**
  * PlacedObject Component
- * Simple cylinder to show where the user clicked
+ * The 3D object that gets spawned
  */
-function PlacedObject({ position }) {
+function PlacedObject({ position, rotation }) {
   return (
-    <mesh position={position}>
+    <mesh position={position} rotation={rotation}>
       <cylinderGeometry args={[0.05, 0.05, 0.2, 32]} />
-      <meshStandardMaterial color="hotpink" roughness={0.3} metalness={0.8} />
+      <meshStandardMaterial color="hotpink" />
     </mesh>
   );
 }
 
 /**
  * ARScene Component
- * Manages the scene content and interaction logic
+ * Manages the XR session content
  */
 function ARScene() {
   const [objects, setObjects] = useState([]);
-  const [reticleData, setReticleData] = useState({
-    visible: false,
-    position: [0, 0, 0],
-    rotation: [0, 0, 0]
-  });
 
-  // Simulated Hit Test: Raycast against an invisible floor plane
-  const handlePointerMove = (e) => {
-    setReticleData({
-      visible: true,
-      position: e.point,
-      rotation: [-Math.PI / 2, 0, 0] // Flat on ground
-    });
-  };
+  // Callback when reticle is tapped
+  const placeObject = (e) => {
+    // The event contains the intersection point where the tap occurred
+    // relative to the Reticle's current position in the real world.
+    
+    // NOTE: In the mock Interactive component, e.intersection might be different
+    // than in WebXR. In WebXR, 'e' is an XRInteractionEvent.
+    // We'll use a fallback for safety here.
+    const point = e.intersection ? e.intersection.point : new THREE.Vector3(0, 0, 0);
+    const rotation = e.intersection ? e.intersection.object.rotation : new THREE.Euler();
 
-  const handlePointerMiss = () => {
-    setReticleData((prev) => ({ ...prev, visible: false }));
-  };
-
-  const handlePlaceObject = (e) => {
-    e.stopPropagation();
-    if (reticleData.visible) {
-      setObjects((prev) => [
-        ...prev,
-        {
-          position: e.point,
-          id: Date.now()
-        }
-      ]);
-    }
+    setObjects((prev) => [
+      ...prev,
+      {
+        id: Date.now(),
+        position: point,
+        rotation: rotation
+      }
+    ]);
   };
 
   return (
     <>
       <ambientLight intensity={0.5} />
-      <directionalLight position={[10, 10, 5]} intensity={1} castShadow />
+      <pointLight position={[10, 10, 10]} />
 
-      {/* Invisible Floor for "Hit Testing" simulation */}
-      <mesh 
-        rotation={[-Math.PI / 2, 0, 0]} 
-        position={[0, -0.01, 0]} 
-        onPointerMove={handlePointerMove}
-        onPointerOut={handlePointerMiss}
-        onClick={handlePlaceObject}
-      >
-        <planeGeometry args={[100, 100]} />
-        <meshBasicMaterial visible={false} />
-      </mesh>
+      {/* The Reticle drives the interaction */}
+      <Reticle onPlace={placeObject} />
 
-      {/* The Reticle detects the plane and shows the grid */}
-      <Reticle 
-        visible={reticleData.visible} 
-        position={reticleData.position}
-        rotation={[0, 0, 0]} 
-      />
-
-      {/* Render placed objects */}
+      {/* Render all placed objects */}
       {objects.map((obj) => (
-        <PlacedObject key={obj.id} position={obj.position} />
+        <PlacedObject 
+          key={obj.id} 
+          position={obj.position} 
+          rotation={obj.rotation} 
+        />
       ))}
     </>
   );
@@ -125,29 +138,24 @@ function ARScene() {
 
 export default function App() {
   return (
-    <div className="h-screen w-full bg-gray-900 text-white flex flex-col items-center justify-center relative overflow-hidden">
+    <div className="h-screen w-full bg-black text-white flex flex-col items-center justify-center">
       
-      {/* Overlay UI */}
+      {/* Overlay UI instructions */}
       <div className="absolute top-10 left-0 w-full z-10 pointer-events-none flex flex-col items-center p-4">
-        <h1 className="text-3xl font-bold mb-2 drop-shadow-md">AR Plane Detector (Simulated)</h1>
-        <div className="text-sm bg-black/60 px-6 py-3 rounded-xl backdrop-blur-md text-center max-w-md">
-          <p className="mb-2"><strong>Simulation Mode Active</strong></p>
-          <p className="text-gray-300 text-xs">
-            Since WebXR isn't available in this preview, we are simulating plane detection.
-            Move your mouse (or drag finger) to move the reticle. Click/Tap to place markers.
-          </p>
-        </div>
+        <h1 className="text-2xl font-bold mb-2 drop-shadow-md">AR Plane Detector</h1>
+        <p className="text-sm bg-black/50 px-4 py-2 rounded-full backdrop-blur-sm">
+          Point camera at floor &bull; Tap grid to place
+        </p>
       </div>
 
-      <Canvas shadows>
-        {/* Camera setup for simulation */}
-        <PerspectiveCamera makeDefault position={[0, 2, 4]} fov={50} />
-        <OrbitControls makeDefault minPolarAngle={0} maxPolarAngle={Math.PI / 2.2} />
-        
-        <ARScene />
-        
-        {/* Background grid to give context in 3D space */}
-        <gridHelper args={[20, 20, 0x444444, 0x222222]} position={[0, -0.02, 0]} />
+      {/* ARButton handles the WebXR session request. */}
+      {/* In Real AR, pass sessionInit={{ requiredFeatures: ['hit-test'] }} */}
+      <ARButton />
+
+      <Canvas>
+        <XR>
+          <ARScene />
+        </XR>
       </Canvas>
     </div>
   );
