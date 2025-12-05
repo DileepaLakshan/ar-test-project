@@ -180,8 +180,8 @@ export default function App() {
   const startAR = async () => {
     try {
       const session = await navigator.xr.requestSession('immersive-ar', {
-        requiredFeatures: ['hit-test', 'plane-detection'],
-        planeDetectionState: { enabled: true }
+        requiredFeatures: ['local'],
+        optionalFeatures: ['hit-test', 'plane-detection']
       });
 
       sessionRef.current = session;
