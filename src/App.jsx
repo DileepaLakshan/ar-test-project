@@ -4,6 +4,7 @@ import * as THREE from "three";
 const ARViewer = () => {
   const containerRef = useRef();
   const [isSupported, setIsSupported] = useState(false);
+  const [isARActive, setIsARActive] = useState(false); // Track if AR is running
   const [status, setStatus] = useState("Initializing...");
   const [mode, setMode] = useState("Tile"); // 'Tile' or 'Textile'
 
@@ -46,7 +47,6 @@ const ARViewer = () => {
     a.renderer.xr.enabled = true;
     
     // Append the canvas to the container
-    // Note: React controls the container's children, so we must be careful with cleanup
     container.appendChild(a.renderer.domElement);
 
     // Reticle (The Cursor)
@@ -74,8 +74,6 @@ const ARViewer = () => {
       window.removeEventListener("resize", onResize);
       if (a.renderer) {
         a.renderer.dispose();
-        // FIX: Do NOT use innerHTML = "" here. It wipes React's buttons/UI.
-        // Instead, only remove the canvas element we manually added.
         const canvas = a.renderer.domElement;
         if (container && container.contains(canvas)) {
           container.removeChild(canvas);
@@ -100,7 +98,6 @@ const ARViewer = () => {
         // Create mesh if new plane
         if (!planeMesh) {
           const geometry = new THREE.PlaneGeometry(1, 1); // Helper geometry
-          // Rotate to lie flat on the defined plane space
           geometry.rotateX(-Math.PI / 2); 
           
           const material = new THREE.MeshBasicMaterial({
@@ -130,8 +127,8 @@ const ARViewer = () => {
     if (!a.renderer) return;
 
     const sessionInit = {
-      requiredFeatures: ["hit-test"], // Only require hit-test for broad compatibility
-      optionalFeatures: ["dom-overlay", "plane-detection"], // Make plane-detection optional
+      requiredFeatures: ["hit-test"], 
+      optionalFeatures: ["dom-overlay", "plane-detection"], 
       domOverlay: { root: document.body }
     };
 
@@ -140,7 +137,8 @@ const ARViewer = () => {
       a.renderer.xr.setReferenceSpaceType("local");
       a.renderer.xr.setSession(session);
       
-      setStatus("AR Session Started. Scan floor/walls.");
+      setStatus("Scanning surfaces...");
+      setIsARActive(true); // Hide the start button
 
       // Controller for taps
       const controller = a.renderer.xr.getController(0);
@@ -149,6 +147,7 @@ const ARViewer = () => {
 
       session.addEventListener("end", () => {
         setStatus("Session Ended");
+        setIsARActive(false); // Show the start button again
         a.hitTestSourceRequested = false;
         a.hitTestSource = null;
         a.reticle.visible = false;
@@ -160,10 +159,7 @@ const ARViewer = () => {
       // Render Loop
       a.renderer.setAnimationLoop((timestamp, frame) => {
         if (frame) {
-          // 1. Hit Test Logic
           handleHitTest(a, frame);
-          
-          // 2. Plane Visualization Logic
           updatePlanes(frame, a);
         }
         a.renderer.render(a.scene, a.camera);
@@ -171,14 +167,13 @@ const ARViewer = () => {
 
     } catch (e) {
       console.error(e);
-      setStatus("Failed to start AR: " + e.message);
+      setStatus("Error: " + e.message);
     }
   };
 
   const handleHitTest = (a, frame) => {
     const session = a.renderer.xr.getSession();
 
-    // Request source once
     if (!a.hitTestSourceRequested) {
       session.requestReferenceSpace("viewer").then((referenceSpace) => {
         session.requestHitTestSource({ space: referenceSpace }).then((source) => {
@@ -203,11 +198,9 @@ const ARViewer = () => {
         a.reticle.matrix.fromArray(pose.transform.matrix);
 
         // Visual Feedback based on Angle
-        // Extract up vector from matrix to determine if floor or wall
         const rotationMatrix = new THREE.Matrix4().extractRotation(a.reticle.matrix);
         const up = new THREE.Vector3(0, 1, 0).applyMatrix4(rotationMatrix);
         
-        // If Y is close to 1, it's a floor. If Y is close to 0, it's a wall.
         if (Math.abs(up.y) > 0.5) {
             a.reticle.material.color.setHex(0x00ff00); // Green (Floor)
         } else {
@@ -222,16 +215,13 @@ const ARViewer = () => {
   const onSelect = () => {
     const a = app.current;
     if (a.reticle.visible) {
-      // Create the Tile/Textile
-      const geometry = new THREE.BoxGeometry(0.2, 0.01, 0.2); // Thin tile
+      const geometry = new THREE.BoxGeometry(0.2, 0.01, 0.2); 
       const material = new THREE.MeshStandardMaterial({
-        color: modeRef.current === "Tile" ? 0xff4444 : 0x4444ff, // Red or Blue
+        color: modeRef.current === "Tile" ? 0xff4444 : 0x4444ff, 
         roughness: 0.5
       });
       const mesh = new THREE.Mesh(geometry, material);
 
-      // Copy position/rotation exactly from Reticle
-      // This ensures it aligns with the wall or floor perfectly
       mesh.position.setFromMatrixPosition(a.reticle.matrix);
       mesh.quaternion.setFromRotationMatrix(a.reticle.matrix);
 
@@ -239,15 +229,20 @@ const ARViewer = () => {
     }
   };
 
-  // React State Wrapper to update the mutable 'mode' ref used in onSelect 
   const modeRef = useRef(mode);
   useEffect(() => { modeRef.current = mode; }, [mode]);
   
-  // Update listener logic for closure safety
-  // We use modeRef inside onSelect, so we don't need to re-bind the listener.
-
   return (
-    <div ref={containerRef} style={{ width: "100%", height: "100%", position: "relative", backgroundColor: "#000" }}>
+    <div 
+      ref={containerRef} 
+      style={{ 
+        width: "100%", 
+        height: "100%", 
+        position: "relative", 
+        // IMPORTANT: Transparent background when AR is active so camera shows through
+        backgroundColor: isARActive ? "transparent" : "#000" 
+      }}
+    >
       {/* UI Overlay */}
       <div style={{
         position: "absolute", top: 20, left: 20, zIndex: 10,
@@ -283,7 +278,8 @@ const ARViewer = () => {
 
       {!isSupported && <div style={{position:"absolute", top:"50%", left:0, width:"100%", textAlign:"center", color:"red"}}>WebXR NOT SUPPORTED</div>}
 
-      {isSupported && (
+      {/* Hide Start Button when AR is active */}
+      {isSupported && !isARActive && (
         <button 
           onClick={startAR}
           style={{
