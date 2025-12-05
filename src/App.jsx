@@ -130,8 +130,8 @@ const ARViewer = () => {
     if (!a.renderer) return;
 
     const sessionInit = {
-      requiredFeatures: ["hit-test", "plane-detection"], // Request Plane Detection
-      optionalFeatures: ["dom-overlay"],
+      requiredFeatures: ["hit-test"], // Only require hit-test for broad compatibility
+      optionalFeatures: ["dom-overlay", "plane-detection"], // Make plane-detection optional
       domOverlay: { root: document.body }
     };
 
