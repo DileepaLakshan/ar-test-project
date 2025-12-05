@@ -136,7 +136,7 @@ const ARViewer = () => {
             polygonOffsetFactor: -1 // Pull slightly forward to avoid z-fighting with real floor
           });
           
-          // Geometry placeholder, will be updated immediately below
+          // Geometry placeholder
           const geometry = new THREE.BufferGeometry();
           
           planeMesh = new THREE.Mesh(geometry, material);
@@ -146,39 +146,59 @@ const ARViewer = () => {
           a.planes.set(plane, planeMesh);
         }
 
-        // 2. Update Geometry if the plane has expanded/changed
-        if (plane.lastChangedTime !== planeMesh.userData.lastChangedTime) {
-          planeMesh.userData.lastChangedTime = plane.lastChangedTime;
+        // 2. Update Geometry based on Orientation
+        // HORIZONTAL (Floor): Use Infinite Plane
+        // VERTICAL (Wall): Use Detected Polygon
+        
+        if (plane.orientation === "horizontal") {
+           // Create geometry only once for floors (Infinite Plane)
+           if (!planeMesh.geometry.attributes.position || planeMesh.geometry.type !== 'PlaneGeometry') {
+              // Create a huge plane (1000m x 1000m)
+              const geometry = new THREE.PlaneGeometry(1000, 1000);
+              geometry.rotateX(-Math.PI / 2);
+              
+              // Scale UVs so texture doesn't stretch. 
+              // 1000 meters size = 1000 texture repeats (approx)
+              const uv = geometry.attributes.uv;
+              for (let i = 0; i < uv.count; i++) {
+                uv.setXY(i, uv.getX(i) * 1000, uv.getY(i) * 1000);
+              }
+              
+              if (planeMesh.geometry) planeMesh.geometry.dispose();
+              planeMesh.geometry = geometry;
+           }
+           // We do NOT update geometry on plane.lastChangedTime for floors, 
+           // because we want it to stay infinite.
+           
+        } else {
+           // Vertical Walls: Stick to the scanned polygon
+           if (plane.lastChangedTime !== planeMesh.userData.lastChangedTime) {
+              planeMesh.userData.lastChangedTime = plane.lastChangedTime;
 
-          // Convert AR polygon points to Three.js Shape
-          const polygon = plane.polygon;
-          const shape = new THREE.Shape();
-          
-          polygon.forEach((point, i) => {
-            if (i === 0) shape.moveTo(point.x, point.z);
-            else shape.lineTo(point.x, point.z);
-          });
+              const polygon = plane.polygon;
+              const shape = new THREE.Shape();
+              
+              polygon.forEach((point, i) => {
+                if (i === 0) shape.moveTo(point.x, point.z);
+                else shape.lineTo(point.x, point.z);
+              });
 
-          // Create geometry from shape
-          const geometry = new THREE.ShapeGeometry(shape);
-          geometry.rotateX(-Math.PI / 2); // Rotate to align with AR plane system
+              const geometry = new THREE.ShapeGeometry(shape);
+              geometry.rotateX(-Math.PI / 2);
 
-          // FIX UVs: Map UVs to World Coordinates for consistent tiling size
-          // By default UVs are mapped 0..1 to bounding box. We want 1 unit = 1 meter.
-          const posAttribute = geometry.attributes.position;
-          const uvAttribute = geometry.attributes.uv;
-          
-          for (let i = 0; i < posAttribute.count; i++) {
-             const x = posAttribute.getX(i);
-             // After rotation, Z in world is Y in local before rotation... 
-             // ShapeGeometry is XY. We rotated X-90. So local Y became World Z.
-             // We want to map X -> U, Z -> V.
-             const z = posAttribute.getZ(i);
-             uvAttribute.setXY(i, x, z);
-          }
-          
-          planeMesh.geometry.dispose();
-          planeMesh.geometry = geometry;
+              // Map UVs to World Coordinates for consistent tiling size on walls
+              const posAttribute = geometry.attributes.position;
+              const uvAttribute = geometry.attributes.uv;
+              
+              for (let i = 0; i < posAttribute.count; i++) {
+                 const x = posAttribute.getX(i);
+                 const z = posAttribute.getZ(i);
+                 uvAttribute.setXY(i, x, z);
+              }
+              
+              if (planeMesh.geometry) planeMesh.geometry.dispose();
+              planeMesh.geometry = geometry;
+           }
         }
 
         // 3. Update Position & Rotation
@@ -204,7 +224,7 @@ const ARViewer = () => {
       a.renderer.xr.setReferenceSpaceType("local");
       a.renderer.xr.setSession(session);
       
-      setStatus("Scanning surfaces... Move around to expand tiles.");
+      setStatus("Scanning surfaces... Floor will tile infinitely.");
       setIsARActive(true);
 
       const controller = a.renderer.xr.getController(0);
