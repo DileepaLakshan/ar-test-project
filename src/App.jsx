@@ -4,11 +4,10 @@ import * as THREE from "three";
 const ARViewer = () => {
   const containerRef = useRef();
   const [isSupported, setIsSupported] = useState(false);
-  const [isARActive, setIsARActive] = useState(false); // Track if AR is running
+  const [isARActive, setIsARActive] = useState(false);
   const [status, setStatus] = useState("Initializing...");
-  const [mode, setMode] = useState("Tile"); // 'Tile' or 'Textile'
+  const [mode, setMode] = useState("Tile"); 
 
-  // App state stored in ref to access inside closures/loops without re-renders
   const app = useRef({
     scene: null,
     camera: null,
@@ -16,40 +15,38 @@ const ARViewer = () => {
     reticle: null,
     hitTestSource: null,
     hitTestSourceRequested: false,
-    planes: new Map(), // To store detected plane meshes
-    items: [] // To store placed items
+    planes: new Map(),
+    items: [],
+    // Cache textures so we don't recreate them every frame
+    floorTexture: null,
+    wallTexture: null
   });
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    // 1. Initialize Three.js Scene
     const a = app.current;
     a.scene = new THREE.Scene();
 
-    a.camera = new THREE.PerspectiveCamera(
-      70,
-      window.innerWidth / window.innerHeight,
-      0.01,
-      20
-    );
+    a.camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
-    // Light
     const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
     light.position.set(0.5, 1, 0.25);
     a.scene.add(light);
 
-    // Renderer
     a.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     a.renderer.setPixelRatio(window.devicePixelRatio);
     a.renderer.setSize(window.innerWidth, window.innerHeight);
     a.renderer.xr.enabled = true;
     
-    // Append the canvas to the container
     container.appendChild(a.renderer.domElement);
 
-    // Reticle (The Cursor)
+    // --- Generate Tile Textures ---
+    a.floorTexture = createTileTexture('#ffffff', '#cccccc', 4); // White/Grey tiles
+    a.wallTexture = createTileTexture('#ffffff', '#aaccff', 2);  // White/Blue tiles
+
+    // Reticle
     const ringGeo = new THREE.RingGeometry(0.1, 0.15, 32).rotateX(-Math.PI / 2);
     const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
     a.reticle = new THREE.Mesh(ringGeo, ringMat);
@@ -57,12 +54,10 @@ const ARViewer = () => {
     a.reticle.visible = false;
     a.scene.add(a.reticle);
 
-    // Check AR Support
     if ("xr" in navigator) {
       navigator.xr.isSessionSupported("immersive-ar").then(setIsSupported);
     }
 
-    // Resize Handler
     const onResize = () => {
       a.camera.aspect = window.innerWidth / window.innerHeight;
       a.camera.updateProjectionMatrix();
@@ -82,6 +77,39 @@ const ARViewer = () => {
     };
   }, []);
 
+  // --- Helper: Create Procedural Tile Texture ---
+  const createTileTexture = (color1, color2, segments) => {
+    const size = 512;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    
+    // Background
+    ctx.fillStyle = color1;
+    ctx.fillRect(0, 0, size, size);
+    
+    // Grid lines (grout)
+    ctx.strokeStyle = color2;
+    ctx.lineWidth = 10;
+    ctx.strokeRect(0, 0, size, size);
+    
+    // Inner pattern if needed, or just simple border
+    // Let's make a cross pattern
+    ctx.beginPath();
+    ctx.moveTo(size/2, 0); ctx.lineTo(size/2, size);
+    ctx.moveTo(0, size/2); ctx.lineTo(size, size/2);
+    ctx.stroke();
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    // Assume 1 texture unit = 1 meter. 
+    // If we want tiles to be 0.5m, we repeat 2 times per meter.
+    texture.repeat.set(2, 2); 
+    return texture;
+  };
+
   // --- Logic to visualize planes (The "Tiles" for walls/floors) ---
   const updatePlanes = (frame, a) => {
     const detectedPlanes = frame.detectedPlanes;
@@ -95,39 +123,78 @@ const ARViewer = () => {
       if (planePose) {
         let planeMesh = a.planes.get(plane);
 
-        // Create mesh if new plane
+        // 1. Initial Creation
         if (!planeMesh) {
-          const geometry = new THREE.PlaneGeometry(1, 1); // Helper geometry
-          geometry.rotateX(-Math.PI / 2); 
-          
-          const material = new THREE.MeshBasicMaterial({
-            color: plane.orientation === "horizontal" ? 0x00ff00 : 0x00ffff, // Green=Floor, Cyan=Wall
+          const material = new THREE.MeshStandardMaterial({
+            map: plane.orientation === "horizontal" ? a.floorTexture : a.wallTexture,
             transparent: true,
-            opacity: 0.1,
+            opacity: 0.7, // See-through slightly
             side: THREE.DoubleSide,
-            depthWrite: false, // Don't occlude other objects
+            roughness: 0.5,
+            metalness: 0.1,
+            polygonOffset: true, 
+            polygonOffsetFactor: -1 // Pull slightly forward to avoid z-fighting with real floor
           });
-
+          
+          // Geometry placeholder, will be updated immediately below
+          const geometry = new THREE.BufferGeometry();
+          
           planeMesh = new THREE.Mesh(geometry, material);
           planeMesh.matrixAutoUpdate = false; 
+          planeMesh.userData = { lastChangedTime: -1 }; // Track updates
           a.scene.add(planeMesh);
           a.planes.set(plane, planeMesh);
         }
 
-        // Update Position & Rotation
+        // 2. Update Geometry if the plane has expanded/changed
+        if (plane.lastChangedTime !== planeMesh.userData.lastChangedTime) {
+          planeMesh.userData.lastChangedTime = plane.lastChangedTime;
+
+          // Convert AR polygon points to Three.js Shape
+          const polygon = plane.polygon;
+          const shape = new THREE.Shape();
+          
+          polygon.forEach((point, i) => {
+            if (i === 0) shape.moveTo(point.x, point.z);
+            else shape.lineTo(point.x, point.z);
+          });
+
+          // Create geometry from shape
+          const geometry = new THREE.ShapeGeometry(shape);
+          geometry.rotateX(-Math.PI / 2); // Rotate to align with AR plane system
+
+          // FIX UVs: Map UVs to World Coordinates for consistent tiling size
+          // By default UVs are mapped 0..1 to bounding box. We want 1 unit = 1 meter.
+          const posAttribute = geometry.attributes.position;
+          const uvAttribute = geometry.attributes.uv;
+          
+          for (let i = 0; i < posAttribute.count; i++) {
+             const x = posAttribute.getX(i);
+             // After rotation, Z in world is Y in local before rotation... 
+             // ShapeGeometry is XY. We rotated X-90. So local Y became World Z.
+             // We want to map X -> U, Z -> V.
+             const z = posAttribute.getZ(i);
+             uvAttribute.setXY(i, x, z);
+          }
+          
+          planeMesh.geometry.dispose();
+          planeMesh.geometry = geometry;
+        }
+
+        // 3. Update Position & Rotation
         planeMesh.matrix.fromArray(planePose.transform.matrix);
         planeMesh.visible = true;
       }
     });
   };
 
-  // --- Start AR Session ---
   const startAR = async () => {
     const a = app.current;
     if (!a.renderer) return;
 
     const sessionInit = {
       requiredFeatures: ["hit-test"], 
+      // 'plane-detection' is CRITICAL for the floor tiling to work
       optionalFeatures: ["dom-overlay", "plane-detection"], 
       domOverlay: { root: document.body }
     };
@@ -137,26 +204,23 @@ const ARViewer = () => {
       a.renderer.xr.setReferenceSpaceType("local");
       a.renderer.xr.setSession(session);
       
-      setStatus("Scanning surfaces...");
-      setIsARActive(true); // Hide the start button
+      setStatus("Scanning surfaces... Move around to expand tiles.");
+      setIsARActive(true);
 
-      // Controller for taps
       const controller = a.renderer.xr.getController(0);
       controller.addEventListener("select", onSelect);
       a.scene.add(controller);
 
       session.addEventListener("end", () => {
         setStatus("Session Ended");
-        setIsARActive(false); // Show the start button again
+        setIsARActive(false);
         a.hitTestSourceRequested = false;
         a.hitTestSource = null;
         a.reticle.visible = false;
-        // Clean up planes
         a.planes.forEach(mesh => a.scene.remove(mesh));
         a.planes.clear();
       });
 
-      // Render Loop
       a.renderer.setAnimationLoop((timestamp, frame) => {
         if (frame) {
           handleHitTest(a, frame);
@@ -197,14 +261,13 @@ const ARViewer = () => {
         a.reticle.visible = true;
         a.reticle.matrix.fromArray(pose.transform.matrix);
 
-        // Visual Feedback based on Angle
         const rotationMatrix = new THREE.Matrix4().extractRotation(a.reticle.matrix);
         const up = new THREE.Vector3(0, 1, 0).applyMatrix4(rotationMatrix);
         
         if (Math.abs(up.y) > 0.5) {
-            a.reticle.material.color.setHex(0x00ff00); // Green (Floor)
+            a.reticle.material.color.setHex(0x00ff00); 
         } else {
-            a.reticle.material.color.setHex(0x00ffff); // Cyan (Wall)
+            a.reticle.material.color.setHex(0x00ffff); 
         }
       } else {
         a.reticle.visible = false;
@@ -215,10 +278,11 @@ const ARViewer = () => {
   const onSelect = () => {
     const a = app.current;
     if (a.reticle.visible) {
-      const geometry = new THREE.BoxGeometry(0.2, 0.01, 0.2); 
+      // Place a single distinct tile on top of the grid
+      const geometry = new THREE.BoxGeometry(0.2, 0.02, 0.2); 
       const material = new THREE.MeshStandardMaterial({
-        color: modeRef.current === "Tile" ? 0xff4444 : 0x4444ff, 
-        roughness: 0.5
+        color: modeRef.current === "Tile" ? 0xff0000 : 0x0000ff, // Pure Red/Blue to contrast with grid
+        roughness: 0.2
       });
       const mesh = new THREE.Mesh(geometry, material);
 
@@ -239,18 +303,16 @@ const ARViewer = () => {
         width: "100%", 
         height: "100%", 
         position: "relative", 
-        // IMPORTANT: Transparent background when AR is active so camera shows through
         backgroundColor: isARActive ? "transparent" : "#000" 
       }}
     >
-      {/* UI Overlay */}
       <div style={{
         position: "absolute", top: 20, left: 20, zIndex: 10,
         color: "white", fontFamily: "sans-serif", background: "rgba(0,0,0,0.5)", padding: "10px", borderRadius: "8px"
       }}>
         <h2 style={{margin: "0 0 10px 0"}}>AR Surface Designer</h2>
         <div style={{marginBottom: "10px"}}>Status: {status}</div>
-        <div style={{fontSize: "0.9em", marginBottom: "10px"}}>Green=Floor, Cyan=Wall</div>
+        <div style={{fontSize: "0.9em", marginBottom: "10px"}}>Scan floor to expand tiles</div>
         
         <div style={{display: "flex", gap: "10px"}}>
           <button 
@@ -261,7 +323,7 @@ const ARViewer = () => {
               color: mode === "Tile" ? "#fff" : "#000"
             }}
           >
-            Red Tile
+            Red Marker
           </button>
           <button 
             onClick={() => setMode("Textile")}
@@ -271,14 +333,13 @@ const ARViewer = () => {
               color: mode === "Textile" ? "#fff" : "#000"
             }}
           >
-            Blue Textile
+            Blue Marker
           </button>
         </div>
       </div>
 
       {!isSupported && <div style={{position:"absolute", top:"50%", left:0, width:"100%", textAlign:"center", color:"red"}}>WebXR NOT SUPPORTED</div>}
 
-      {/* Hide Start Button when AR is active */}
       {isSupported && !isARActive && (
         <button 
           onClick={startAR}
