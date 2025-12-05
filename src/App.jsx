@@ -122,13 +122,19 @@ const ARViewer = () => {
       
       if (planePose) {
         let planeMesh = a.planes.get(plane);
+        
+        // Check Orientation
+        const isHorizontal = plane.orientation === "horizontal";
 
         // -- Initialize Mesh --
         if (!planeMesh) {
           const material = new THREE.MeshBasicMaterial({
-            map: a.gridTexture,
+            // Only apply Grid Texture to Floors (Horizontal)
+            map: isHorizontal ? a.gridTexture : null,
+            // White for floor, Turquoise for walls
+            color: isHorizontal ? 0xffffff : 0x40e0d0, 
             transparent: true,
-            opacity: 0.8,
+            opacity: isHorizontal ? 0.8 : 0.3, // Make walls fainter
             side: THREE.DoubleSide,
             depthWrite: false, // Prevents z-fighting
           });
@@ -156,19 +162,21 @@ const ARViewer = () => {
           const geometry = new THREE.ShapeGeometry(shape);
           geometry.rotateX(-Math.PI / 2);
 
-          // -- World-Aligned UV Mapping --
-          // Map UVs directly to World X/Z. 
-          // Multiply by a factor to control grid size. 
-          // e.g., * 5 means 5 tiles per meter (20cm tiles).
-          const scale = 5.0; 
-          
-          const posAttribute = geometry.attributes.position;
-          const uvAttribute = geometry.attributes.uv;
-          
-          for (let i = 0; i < posAttribute.count; i++) {
-             const x = posAttribute.getX(i);
-             const z = posAttribute.getZ(i);
-             uvAttribute.setXY(i, x * scale, z * scale);
+          // -- World-Aligned UV Mapping (Only useful for Grid Texture) --
+          if (isHorizontal) {
+            // Map UVs directly to World X/Z. 
+            // Multiply by a factor to control grid size. 
+            // e.g., * 5 means 5 tiles per meter (20cm tiles).
+            const scale = 5.0; 
+            
+            const posAttribute = geometry.attributes.position;
+            const uvAttribute = geometry.attributes.uv;
+            
+            for (let i = 0; i < posAttribute.count; i++) {
+               const x = posAttribute.getX(i);
+               const z = posAttribute.getZ(i);
+               uvAttribute.setXY(i, x * scale, z * scale);
+            }
           }
           
           if (planeMesh.geometry) planeMesh.geometry.dispose();
