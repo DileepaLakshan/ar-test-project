@@ -1,363 +1,267 @@
-import React, { useEffect, useRef, useState } from "react";
-import * as THREE from "three";
+import React, { useState, useEffect, useRef } from 'react';
 
-const ARViewer = () => {
-  const containerRef = useRef();
-  const [isSupported, setIsSupported] = useState(false);
-  const [isARActive, setIsARActive] = useState(false);
-  const [status, setStatus] = useState("Initializing...");
-  const [mode, setMode] = useState("Tile"); 
-
-  const app = useRef({
-    scene: null,
-    camera: null,
-    renderer: null,
-    reticle: null,
-    hitTestSource: null,
-    hitTestSourceRequested: false,
-    planes: new Map(),
-    items: [],
-    gridTexture: null
-  });
+export default function App() {
+  const [arSupported, setArSupported] = useState(false);
+  const [arActive, setArActive] = useState(false);
+  const [error, setError] = useState('');
+  const canvasRef = useRef(null);
+  const sessionRef = useRef(null);
+  const glRef = useRef(null);
+  const programRef = useRef(null);
+  const detectedPlanesRef = useRef(new Map());
 
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-
-    const a = app.current;
-    a.scene = new THREE.Scene();
-
-    a.camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
-
-    const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
-    light.position.set(0.5, 1, 0.25);
-    a.scene.add(light);
-
-    a.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    a.renderer.setPixelRatio(window.devicePixelRatio);
-    a.renderer.setSize(window.innerWidth, window.innerHeight);
-    a.renderer.xr.enabled = true;
-    
-    container.appendChild(a.renderer.domElement);
-
-    // --- Generate ARCore-style Grid Texture ---
-    a.gridTexture = createARGridTexture();
-
-    // Reticle
-    const ringGeo = new THREE.RingGeometry(0.1, 0.15, 32).rotateX(-Math.PI / 2);
-    const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    a.reticle = new THREE.Mesh(ringGeo, ringMat);
-    a.reticle.matrixAutoUpdate = false;
-    a.reticle.visible = false;
-    a.scene.add(a.reticle);
-
-    if ("xr" in navigator) {
-      navigator.xr.isSessionSupported("immersive-ar").then(setIsSupported);
-    }
-
-    const onResize = () => {
-      a.camera.aspect = window.innerWidth / window.innerHeight;
-      a.camera.updateProjectionMatrix();
-      a.renderer.setSize(window.innerWidth, window.innerHeight);
-    };
-    window.addEventListener("resize", onResize);
-
-    return () => {
-      window.removeEventListener("resize", onResize);
-      if (a.renderer) {
-        a.renderer.dispose();
-        const canvas = a.renderer.domElement;
-        if (container && container.contains(canvas)) {
-          container.removeChild(canvas);
+    if (navigator.xr) {
+      navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+        setArSupported(supported);
+        if (!supported) {
+          setError('AR not supported on this device');
         }
-      }
-    };
+      });
+    } else {
+      setError('WebXR not available');
+    }
   }, []);
 
-  // --- Helper: Create Grid + Dot Texture (ARCore Style) ---
-  const createARGridTexture = () => {
-    const size = 512;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d');
+  const initWebGL = (canvas, session) => {
+    const gl = canvas.getContext('webgl', { xrCompatible: true });
+    if (!gl) {
+      throw new Error('WebGL not supported');
+    }
 
-    // 1. Transparent Background
-    ctx.clearRect(0, 0, size, size);
+    // Vertex shader
+    const vsSource = `
+      attribute vec3 aPosition;
+      uniform mat4 uProjectionMatrix;
+      uniform mat4 uViewMatrix;
+      uniform mat4 uModelMatrix;
+      void main() {
+        gl_Position = uProjectionMatrix * uViewMatrix * uModelMatrix * vec4(aPosition, 1.0);
+        gl_PointSize = 8.0;
+      }
+    `;
 
-    // 2. Draw Grid Border (White, semi-transparent)
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
-    ctx.lineWidth = 6;
-    ctx.strokeRect(0, 0, size, size);
+    // Fragment shader
+    const fsSource = `
+      precision mediump float;
+      uniform vec4 uColor;
+      void main() {
+        gl_FragColor = uColor;
+      }
+    `;
 
-    // 3. Draw Dots at corners (to mimic the intersection dots)
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-    const r = 16; 
+    const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vertexShader, vsSource);
+    gl.compileShader(vertexShader);
+
+    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fragmentShader, fsSource);
+    gl.compileShader(fragmentShader);
+
+    const program = gl.createProgram();
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error('Shader program failed to link');
+    }
+
+    gl.useProgram(program);
     
-    // Helper to draw circle
-    const dot = (x, y) => {
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI*2);
-        ctx.fill();
-    };
+    glRef.current = gl;
+    programRef.current = program;
     
-    // Draw dots at 4 corners
-    dot(0, 0); dot(size, 0); dot(0, size); dot(size, size);
-
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.wrapS = THREE.RepeatWrapping;
-    texture.wrapT = THREE.RepeatWrapping;
-    return texture;
+    return gl;
   };
 
-  // --- Update Planes Logic ---
-  const updatePlanes = (frame, a) => {
-    const detectedPlanes = frame.detectedPlanes;
-    if (!detectedPlanes) return;
+  const createGridVertices = (plane) => {
+    const vertices = [];
+    const size = 0.2; // 20cm grid spacing
+    const extent = 2; // 2 meters in each direction
+    
+    // Create grid lines
+    for (let x = -extent; x <= extent; x += size) {
+      vertices.push(x, 0, -extent);
+      vertices.push(x, 0, extent);
+    }
+    for (let z = -extent; z <= extent; z += size) {
+      vertices.push(-extent, 0, z);
+      vertices.push(extent, 0, z);
+    }
+    
+    return new Float32Array(vertices);
+  };
 
-    const referenceSpace = a.renderer.xr.getReferenceSpace();
-
-    detectedPlanes.forEach((plane) => {
-      const planePose = frame.getPose(plane.planeSpace, referenceSpace);
-      
-      if (planePose) {
-        let planeMesh = a.planes.get(plane);
-        
-        // Check Orientation
-        const isHorizontal = plane.orientation === "horizontal";
-
-        // -- Initialize Mesh --
-        if (!planeMesh) {
-          const material = new THREE.MeshBasicMaterial({
-            // Only apply Grid Texture to Floors (Horizontal)
-            map: isHorizontal ? a.gridTexture : null,
-            // White for floor, Turquoise for walls
-            color: isHorizontal ? 0xffffff : 0x40e0d0, 
-            transparent: true,
-            opacity: isHorizontal ? 0.8 : 0.3, // Make walls fainter
-            side: THREE.DoubleSide,
-            depthWrite: false, // Prevents z-fighting
-          });
-          
-          const geometry = new THREE.BufferGeometry();
-          planeMesh = new THREE.Mesh(geometry, material);
-          planeMesh.matrixAutoUpdate = false; 
-          planeMesh.userData = { lastChangedTime: -1 }; 
-          a.scene.add(planeMesh);
-          a.planes.set(plane, planeMesh);
-        }
-
-        // -- Update Geometry (Bounded Polygon) --
-        // We use the exact shape detected by AR (Tabletop, Floor segment, etc.)
-        if (plane.lastChangedTime !== planeMesh.userData.lastChangedTime) {
-          planeMesh.userData.lastChangedTime = plane.lastChangedTime;
-
-          const polygon = plane.polygon;
-          const shape = new THREE.Shape();
-          polygon.forEach((point, i) => {
-            if (i === 0) shape.moveTo(point.x, point.z);
-            else shape.lineTo(point.x, point.z);
-          });
-          
-          const geometry = new THREE.ShapeGeometry(shape);
-          geometry.rotateX(-Math.PI / 2);
-
-          // -- World-Aligned UV Mapping (Only useful for Grid Texture) --
-          if (isHorizontal) {
-            // Map UVs directly to World X/Z. 
-            // Multiply by a factor to control grid size. 
-            // e.g., * 5 means 5 tiles per meter (20cm tiles).
-            const scale = 5.0; 
-            
-            const posAttribute = geometry.attributes.position;
-            const uvAttribute = geometry.attributes.uv;
-            
-            for (let i = 0; i < posAttribute.count; i++) {
-               const x = posAttribute.getX(i);
-               const z = posAttribute.getZ(i);
-               uvAttribute.setXY(i, x * scale, z * scale);
-            }
-          }
-          
-          if (planeMesh.geometry) planeMesh.geometry.dispose();
-          planeMesh.geometry = geometry;
-        }
-
-        // -- Update Position --
-        planeMesh.matrix.fromArray(planePose.transform.matrix);
-        planeMesh.visible = true;
+  const createDotVertices = (plane) => {
+    const vertices = [];
+    const size = 0.3; // 30cm dot spacing
+    const extent = 2;
+    
+    // Create dot pattern
+    for (let x = -extent; x <= extent; x += size) {
+      for (let z = -extent; z <= extent; z += size) {
+        vertices.push(x, 0, z);
       }
-    });
+    }
+    
+    return new Float32Array(vertices);
+  };
+
+  const drawPlane = (gl, program, plane, frame, viewMatrix, projectionMatrix, isVertical) => {
+    const pose = frame.getPose(plane.planeSpace, frame.session.referenceSpace);
+    if (!pose) return;
+
+    const vertices = isVertical ? createDotVertices(plane) : createGridVertices(plane);
+    
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+    const positionLoc = gl.getAttribLocation(program, 'aPosition');
+    gl.enableVertexAttribArray(positionLoc);
+    gl.vertexAttribPointer(positionLoc, 3, gl.FLOAT, false, 0, 0);
+
+    const projMatrixLoc = gl.getUniformLocation(program, 'uProjectionMatrix');
+    const viewMatrixLoc = gl.getUniformLocation(program, 'uViewMatrix');
+    const modelMatrixLoc = gl.getUniformLocation(program, 'uModelMatrix');
+    const colorLoc = gl.getUniformLocation(program, 'uColor');
+
+    gl.uniformMatrix4fv(projMatrixLoc, false, projectionMatrix);
+    gl.uniformMatrix4fv(viewMatrixLoc, false, viewMatrix);
+    gl.uniformMatrix4fv(modelMatrixLoc, false, pose.transform.matrix);
+
+    // Green for horizontal (floor), Blue for vertical (walls)
+    const color = isVertical ? [0.2, 0.5, 1.0, 0.8] : [0.2, 1.0, 0.5, 0.8];
+    gl.uniform4fv(colorLoc, color);
+
+    if (isVertical) {
+      gl.drawArrays(gl.POINTS, 0, vertices.length / 3);
+    } else {
+      gl.drawArrays(gl.LINES, 0, vertices.length / 3);
+    }
+  };
+
+  const onXRFrame = (time, frame) => {
+    const session = frame.session;
+    session.requestAnimationFrame(onXRFrame);
+
+    const gl = glRef.current;
+    const program = programRef.current;
+
+    const pose = frame.getViewerPose(session.referenceSpace);
+    if (!pose) return;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    // Detect planes
+    const detectedPlanes = frame.detectedPlanes;
+    if (detectedPlanes) {
+      for (const plane of detectedPlanes) {
+        for (const view of pose.views) {
+          const viewport = session.renderState.baseLayer.getViewport(view);
+          gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+
+          // Determine if plane is horizontal (floor/ceiling) or vertical (wall)
+          const orientation = plane.orientation;
+          const isVertical = orientation === 'vertical';
+
+          drawPlane(gl, program, plane, frame, view.transform.inverse.matrix, 
+                   view.projectionMatrix, isVertical);
+        }
+      }
+    }
   };
 
   const startAR = async () => {
-    const a = app.current;
-    if (!a.renderer) return;
-
-    const sessionInit = {
-      requiredFeatures: ["hit-test"], 
-      optionalFeatures: ["dom-overlay", "plane-detection"], 
-      domOverlay: { root: document.body }
-    };
-
     try {
-      const session = await navigator.xr.requestSession("immersive-ar", sessionInit);
-      a.renderer.xr.setReferenceSpaceType("local");
-      a.renderer.xr.setSession(session);
+      const session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test', 'plane-detection'],
+        planeDetectionState: { enabled: true }
+      });
+
+      sessionRef.current = session;
+      const canvas = canvasRef.current;
       
-      setStatus("Scanning... Surfaces will show grid pattern.");
-      setIsARActive(true);
-
-      const controller = a.renderer.xr.getController(0);
-      controller.addEventListener("select", onSelect);
-      a.scene.add(controller);
-
-      session.addEventListener("end", () => {
-        setStatus("Session Ended");
-        setIsARActive(false);
-        a.hitTestSourceRequested = false;
-        a.hitTestSource = null;
-        a.reticle.visible = false;
-        a.planes.forEach(mesh => a.scene.remove(mesh));
-        a.planes.clear();
-      });
-
-      a.renderer.setAnimationLoop((timestamp, frame) => {
-        if (frame) {
-          handleHitTest(a, frame);
-          updatePlanes(frame, a);
-        }
-        a.renderer.render(a.scene, a.camera);
-      });
-
-    } catch (e) {
-      console.error(e);
-      setStatus("Error: " + e.message);
-    }
-  };
-
-  const handleHitTest = (a, frame) => {
-    const session = a.renderer.xr.getSession();
-
-    if (!a.hitTestSourceRequested) {
-      session.requestReferenceSpace("viewer").then((referenceSpace) => {
-        session.requestHitTestSource({ space: referenceSpace }).then((source) => {
-          a.hitTestSource = source;
-        });
-      });
-      session.addEventListener("end", () => {
-        a.hitTestSourceRequested = false;
-        a.hitTestSource = null;
-      });
-      a.hitTestSourceRequested = true;
-    }
-
-    if (a.hitTestSource) {
-      const hitTestResults = frame.getHitTestResults(a.hitTestSource);
-      if (hitTestResults.length > 0) {
-        const hit = hitTestResults[0];
-        const referenceSpace = a.renderer.xr.getReferenceSpace();
-        const pose = hit.getPose(referenceSpace);
-
-        a.reticle.visible = true;
-        a.reticle.matrix.fromArray(pose.transform.matrix);
-
-        const rotationMatrix = new THREE.Matrix4().extractRotation(a.reticle.matrix);
-        const up = new THREE.Vector3(0, 1, 0).applyMatrix4(rotationMatrix);
-        
-        if (Math.abs(up.y) > 0.5) {
-            a.reticle.material.color.setHex(0x00ff00); 
-        } else {
-            a.reticle.material.color.setHex(0x00ffff); 
-        }
-      } else {
-        a.reticle.visible = false;
-      }
-    }
-  };
-
-  const onSelect = () => {
-    const a = app.current;
-    if (a.reticle.visible) {
-      // Create a marker object
-      const geometry = new THREE.CylinderGeometry(0.05, 0.0, 0.1, 32); 
-      const material = new THREE.MeshStandardMaterial({
-        color: modeRef.current === "Tile" ? 0xff0000 : 0x0000ff, 
-        roughness: 0.2
-      });
-      const mesh = new THREE.Mesh(geometry, material);
+      const gl = initWebGL(canvas, session);
       
-      // Pivot adjust so cylinder sits on ground
-      geometry.translate(0, 0.05, 0);
+      await gl.makeXRCompatible();
+      
+      const layer = new XRWebGLLayer(session, gl);
+      await session.updateRenderState({ baseLayer: layer });
 
-      mesh.position.setFromMatrixPosition(a.reticle.matrix);
-      mesh.quaternion.setFromRotationMatrix(a.reticle.matrix);
+      const referenceSpace = await session.requestReferenceSpace('local');
+      session.referenceSpace = referenceSpace;
 
-      a.scene.add(mesh);
+      session.requestAnimationFrame(onXRFrame);
+
+      session.addEventListener('end', () => {
+        setArActive(false);
+        sessionRef.current = null;
+      });
+
+      setArActive(true);
+    } catch (err) {
+      setError(`Failed to start AR: ${err.message}`);
+      console.error(err);
     }
   };
 
-  const modeRef = useRef(mode);
-  useEffect(() => { modeRef.current = mode; }, [mode]);
-  
+  const stopAR = () => {
+    if (sessionRef.current) {
+      sessionRef.current.end();
+    }
+  };
+
   return (
-    <div 
-      ref={containerRef} 
-      style={{ 
-        width: "100%", 
-        height: "100%", 
-        position: "relative", 
-        backgroundColor: isARActive ? "transparent" : "#000" 
-      }}
-    >
-      <div style={{
-        position: "absolute", top: 20, left: 20, zIndex: 10,
-        color: "white", fontFamily: "sans-serif", background: "rgba(0,0,0,0.5)", padding: "10px", borderRadius: "8px"
-      }}>
-        <h2 style={{margin: "0 0 10px 0"}}>AR Surface Designer</h2>
-        <div style={{marginBottom: "10px"}}>Status: {status}</div>
-        <div style={{fontSize: "0.9em", marginBottom: "10px"}}>Scan surfaces to see grid</div>
-        
-        <div style={{display: "flex", gap: "10px"}}>
-          <button 
-            onClick={() => setMode("Tile")}
-            style={{
-              padding: "10px", border: "none", borderRadius: "4px", fontWeight: "bold",
-              background: mode === "Tile" ? "#ff4444" : "#fff",
-              color: mode === "Tile" ? "#fff" : "#000"
-            }}
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-purple-900 via-blue-900 to-indigo-900 p-4">
+      {!arActive ? (
+        <div className="text-center space-y-6">
+          <h1 className="text-4xl font-bold text-white mb-2">WebXR Plane Detection</h1>
+          <p className="text-blue-200 mb-8">Detect floors and walls in AR</p>
+          
+          {error && (
+            <div className="bg-red-500/20 border border-red-500 text-red-200 px-6 py-3 rounded-lg mb-4">
+              {error}
+            </div>
+          )}
+
+          <button
+            onClick={startAR}
+            disabled={!arSupported}
+            className={`px-8 py-4 rounded-full text-xl font-semibold transition-all transform hover:scale-105 ${
+              arSupported
+                ? 'bg-gradient-to-r from-blue-500 to-purple-600 text-white shadow-lg hover:shadow-xl'
+                : 'bg-gray-600 text-gray-400 cursor-not-allowed'
+            }`}
           >
-            Red Marker
+            View AR
           </button>
-          <button 
-            onClick={() => setMode("Textile")}
-            style={{
-              padding: "10px", border: "none", borderRadius: "4px", fontWeight: "bold",
-              background: mode === "Textile" ? "#4444ff" : "#fff",
-              color: mode === "Textile" ? "#fff" : "#000"
-            }}
+
+          <div className="mt-8 text-sm text-blue-300 max-w-md">
+            <p className="mb-2">• Green grid lines = Horizontal surfaces (floors)</p>
+            <p>• Blue dots = Vertical surfaces (walls)</p>
+          </div>
+        </div>
+      ) : (
+        <div className="fixed top-4 right-4 z-10">
+          <button
+            onClick={stopAR}
+            className="bg-red-500 hover:bg-red-600 text-white px-6 py-3 rounded-full font-semibold shadow-lg"
           >
-            Blue Marker
+            Exit AR
           </button>
         </div>
-      </div>
-
-      {!isSupported && <div style={{position:"absolute", top:"50%", left:0, width:"100%", textAlign:"center", color:"red"}}>WebXR NOT SUPPORTED</div>}
-
-      {isSupported && !isARActive && (
-        <button 
-          onClick={startAR}
-          style={{
-            position: "absolute", bottom: "30px", left: "50%", transform: "translateX(-50%)",
-            padding: "12px 24px", fontSize: "16px", borderRadius: "30px", border: "none",
-            background: "#fff", color: "#000", fontWeight: "bold", boxShadow: "0 4px 10px rgba(0,0,0,0.3)"
-          }}
-        >
-          START AR
-        </button>
       )}
+
+      <canvas
+        ref={canvasRef}
+        className={arActive ? 'fixed inset-0 w-full h-full' : 'hidden'}
+      />
     </div>
   );
-};
-
-export default ARViewer;
+}
