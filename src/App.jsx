@@ -17,7 +17,6 @@ const ARViewer = () => {
     hitTestSourceRequested: false,
     planes: new Map(),
     items: [],
-    // Cache textures so we don't recreate them every frame
     floorTexture: null,
     wallTexture: null
   });
@@ -43,8 +42,8 @@ const ARViewer = () => {
     container.appendChild(a.renderer.domElement);
 
     // --- Generate Tile Textures ---
-    a.floorTexture = createTileTexture('#ffffff', '#cccccc', 4); // White/Grey tiles
-    a.wallTexture = createTileTexture('#ffffff', '#aaccff', 2);  // White/Blue tiles
+    a.floorTexture = createTileTexture('#ffffff', '#999999', 4); 
+    a.wallTexture = createTileTexture('#ffffff', '#aaccff', 2); 
 
     // Reticle
     const ringGeo = new THREE.RingGeometry(0.1, 0.15, 32).rotateX(-Math.PI / 2);
@@ -77,7 +76,6 @@ const ARViewer = () => {
     };
   }, []);
 
-  // --- Helper: Create Procedural Tile Texture ---
   const createTileTexture = (color1, color2, segments) => {
     const size = 512;
     const canvas = document.createElement('canvas');
@@ -85,17 +83,14 @@ const ARViewer = () => {
     canvas.height = size;
     const ctx = canvas.getContext('2d');
     
-    // Background
     ctx.fillStyle = color1;
     ctx.fillRect(0, 0, size, size);
     
-    // Grid lines (grout)
     ctx.strokeStyle = color2;
-    ctx.lineWidth = 10;
+    ctx.lineWidth = 8;
     ctx.strokeRect(0, 0, size, size);
     
-    // Inner pattern if needed, or just simple border
-    // Let's make a cross pattern
+    // Cross pattern
     ctx.beginPath();
     ctx.moveTo(size/2, 0); ctx.lineTo(size/2, size);
     ctx.moveTo(0, size/2); ctx.lineTo(size, size/2);
@@ -104,61 +99,75 @@ const ARViewer = () => {
     const texture = new THREE.CanvasTexture(canvas);
     texture.wrapS = THREE.RepeatWrapping;
     texture.wrapT = THREE.RepeatWrapping;
-    // Assume 1 texture unit = 1 meter. 
-    // If we want tiles to be 0.5m, we repeat 2 times per meter.
+    // 2 repeats per meter = 50cm tiles
     texture.repeat.set(2, 2); 
     return texture;
   };
 
-  // --- Logic to visualize planes (The "Tiles" for walls/floors) ---
   const updatePlanes = (frame, a) => {
     const detectedPlanes = frame.detectedPlanes;
     if (!detectedPlanes) return;
 
     const referenceSpace = a.renderer.xr.getReferenceSpace();
 
+    // 1. First Pass: Find the "Lowest" horizontal plane to identify as the main floor
+    let lowestY = Infinity;
+    let mainFloorPlane = null;
+
+    detectedPlanes.forEach((plane) => {
+      if (plane.orientation === "horizontal") {
+        const planePose = frame.getPose(plane.planeSpace, referenceSpace);
+        if (planePose) {
+          // Matrix element 13 is the Y position (index 13 in column-major 4x4)
+          const y = planePose.transform.matrix[13];
+          if (y < lowestY) {
+            lowestY = y;
+            mainFloorPlane = plane;
+          }
+        }
+      }
+    });
+
+    // 2. Second Pass: Render geometry based on role (Main Floor vs Table vs Wall)
     detectedPlanes.forEach((plane) => {
       const planePose = frame.getPose(plane.planeSpace, referenceSpace);
-      
       if (planePose) {
         let planeMesh = a.planes.get(plane);
 
-        // 1. Initial Creation
+        // -- Initialize Mesh --
         if (!planeMesh) {
           const material = new THREE.MeshStandardMaterial({
             map: plane.orientation === "horizontal" ? a.floorTexture : a.wallTexture,
             transparent: true,
-            opacity: 0.7, // See-through slightly
+            opacity: 0.6,
             side: THREE.DoubleSide,
             roughness: 0.5,
             metalness: 0.1,
             polygonOffset: true, 
-            polygonOffsetFactor: -1 // Pull slightly forward to avoid z-fighting with real floor
+            polygonOffsetFactor: -1 // Helps prevent z-fighting with real world
           });
           
-          // Geometry placeholder
           const geometry = new THREE.BufferGeometry();
-          
           planeMesh = new THREE.Mesh(geometry, material);
           planeMesh.matrixAutoUpdate = false; 
-          planeMesh.userData = { lastChangedTime: -1 }; // Track updates
+          planeMesh.userData = { lastChangedTime: -1, isInfinite: false }; 
           a.scene.add(planeMesh);
           a.planes.set(plane, planeMesh);
         }
 
-        // 2. Update Geometry based on Orientation
-        // HORIZONTAL (Floor): Use Infinite Plane
-        // VERTICAL (Wall): Use Detected Polygon
+        // -- Update Geometry --
         
-        if (plane.orientation === "horizontal") {
-           // Create geometry only once for floors (Infinite Plane)
-           if (!planeMesh.geometry.attributes.position || planeMesh.geometry.type !== 'PlaneGeometry') {
-              // Create a huge plane (1000m x 1000m)
+        // Check if this specific plane is the identified Main Floor
+        const isMainFloor = (plane === mainFloorPlane);
+
+        // Case A: Infinite Floor (Only for the lowest horizontal plane)
+        if (isMainFloor) {
+           if (!planeMesh.userData.isInfinite) {
+              // Switch to Infinite Plane Geometry
               const geometry = new THREE.PlaneGeometry(1000, 1000);
               geometry.rotateX(-Math.PI / 2);
               
-              // Scale UVs so texture doesn't stretch. 
-              // 1000 meters size = 1000 texture repeats (approx)
+              // Scale UVs for world-scale tiling (1000m = 1000 repeats)
               const uv = geometry.attributes.uv;
               for (let i = 0; i < uv.count; i++) {
                 uv.setXY(i, uv.getX(i) * 1000, uv.getY(i) * 1000);
@@ -166,31 +175,36 @@ const ARViewer = () => {
               
               if (planeMesh.geometry) planeMesh.geometry.dispose();
               planeMesh.geometry = geometry;
+              planeMesh.userData.isInfinite = true;
            }
-           // We do NOT update geometry on plane.lastChangedTime for floors, 
-           // because we want it to stay infinite.
-           
-        } else {
-           // Vertical Walls: Stick to the scanned polygon
-           if (plane.lastChangedTime !== planeMesh.userData.lastChangedTime) {
+           // No need to update geometry shape every frame for infinite planes
+        } 
+        // Case B: Bounded Polygon (Walls, Tables, or secondary floor fragments)
+        else {
+           // If it was infinite before but is no longer the lowest, switch back to polygon
+           // OR if it's just a normal update
+           if (plane.lastChangedTime !== planeMesh.userData.lastChangedTime || planeMesh.userData.isInfinite) {
               planeMesh.userData.lastChangedTime = plane.lastChangedTime;
+              planeMesh.userData.isInfinite = false; // It is not infinite
 
               const polygon = plane.polygon;
               const shape = new THREE.Shape();
-              
               polygon.forEach((point, i) => {
                 if (i === 0) shape.moveTo(point.x, point.z);
                 else shape.lineTo(point.x, point.z);
               });
-
               const geometry = new THREE.ShapeGeometry(shape);
               geometry.rotateX(-Math.PI / 2);
 
-              // Map UVs to World Coordinates for consistent tiling size on walls
+              // World-aligned UV Mapping (Planar Projection)
+              // This ensures tiles align even between separate polygons
               const posAttribute = geometry.attributes.position;
               const uvAttribute = geometry.attributes.uv;
-              
               for (let i = 0; i < posAttribute.count; i++) {
+                 // We use the Local X/Z which (after rotation) corresponds to Surface Space
+                 // To align with World, strictly speaking we'd need world coords, 
+                 // but since AR planes are usually aligned to the session origin, 
+                 // mapping X/Z usually gives consistent alignment if planes aren't rotated oddly.
                  const x = posAttribute.getX(i);
                  const z = posAttribute.getZ(i);
                  uvAttribute.setXY(i, x, z);
@@ -201,7 +215,7 @@ const ARViewer = () => {
            }
         }
 
-        // 3. Update Position & Rotation
+        // -- Update Position --
         planeMesh.matrix.fromArray(planePose.transform.matrix);
         planeMesh.visible = true;
       }
@@ -214,7 +228,6 @@ const ARViewer = () => {
 
     const sessionInit = {
       requiredFeatures: ["hit-test"], 
-      // 'plane-detection' is CRITICAL for the floor tiling to work
       optionalFeatures: ["dom-overlay", "plane-detection"], 
       domOverlay: { root: document.body }
     };
@@ -224,7 +237,7 @@ const ARViewer = () => {
       a.renderer.xr.setReferenceSpaceType("local");
       a.renderer.xr.setSession(session);
       
-      setStatus("Scanning surfaces... Floor will tile infinitely.");
+      setStatus("Scanning... Lowest surface becomes infinite floor.");
       setIsARActive(true);
 
       const controller = a.renderer.xr.getController(0);
@@ -298,10 +311,9 @@ const ARViewer = () => {
   const onSelect = () => {
     const a = app.current;
     if (a.reticle.visible) {
-      // Place a single distinct tile on top of the grid
       const geometry = new THREE.BoxGeometry(0.2, 0.02, 0.2); 
       const material = new THREE.MeshStandardMaterial({
-        color: modeRef.current === "Tile" ? 0xff0000 : 0x0000ff, // Pure Red/Blue to contrast with grid
+        color: modeRef.current === "Tile" ? 0xff0000 : 0x0000ff, 
         roughness: 0.2
       });
       const mesh = new THREE.Mesh(geometry, material);
